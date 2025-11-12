@@ -1,0 +1,214 @@
+
+# Enable IP forwarding (do this ONCE)
+sudo sysctl -w net.ipv4.ip_forward=1
+
+
+
+Task 1: VPC Creation and Configuration
+Commands to Run:
+Create VPC1
+sudo python3 vpcctl.py create-vpc --name vpc1 --cidr 10.0.0.0/16
+
+Verification Commands:
+Check bridge IP address
+#1. ip addr show br-vpc1
+
+# 2. Check VPC metadata file
+sudo cat /etc/vpcctl/vpc1.json
+
+# 3. List all bridges
+ip link show type bridge
+
+
+Task 2: Subnet Creation (Public & Private)
+A. Create Public Subnet
+
+sudo python3 vpcctl.py create-subnet --vpc vpc1 --name web --cidr 10.0.1.0/24 --type public
+
+Verification Commands:
+bash# 1. Check namespace was created
+ip netns list | grep vpc1-web
+
+# 2. Check namespace IP configuration
+sudo ip netns exec ns-vpc1-web ip addr show
+
+# 3. Check routing table inside namespace
+sudo ip netns exec ns-vpc1-web ip route
+
+# 4. Check veth pair exists
+ip link show | grep veth-web
+
+# 5. Check NAT rules were added
+sudo iptables -t nat -L -n -v | grep 10.0.1.0
+
+B. Create Private Subnet
+
+sudo python3 vpcctl.py create-subnet --vpc vpc1 --name db --cidr 10.0.2.0/24 --type private
+
+Verification Commands:
+# 1. Check namespace exists
+ip netns list | grep vpc1-db
+
+# 2. Check IP configuration
+sudo ip netns exec ns-vpc1-db ip addr show
+
+# 3. Check routing
+sudo ip netns exec ns-vpc1-db ip route
+
+# 4. Verify NO NAT rules for private subnet
+sudo iptables -t nat -L -n -v | grep 10.0.2.0
+
+
+Task 3: Intra-VPC Communication
+Test Commands:
+Test 1: Public subnet → Private subnet
+sudo ip netns exec ns-vpc1-web ping -c 3 10.0.2.2
+
+# Test 2: Private subnet → Public subnet
+sudo ip netns exec ns-vpc1-db ping -c 3 10.0.1.2
+
+# Check bridge forwarding table
+bridge fdb show br br-vpc1
+
+
+Task 4: VPC Isolation (No Cross-VPC by Default)
+Create Second VPC:
+Create VPC2
+sudo python3 vpcctl.py create-vpc --name vpc2 --cidr 10.1.0.0/16
+
+# Create public subnet in VPC2
+sudo python3 vpcctl.py create-subnet --vpc vpc2 --name app --cidr 10.1.1.0/24 --type public
+
+Test Isolation:
+Test: VPC1 CANNOT reach VPC2 (should fail)
+sudo ip netns exec ns-vpc1-web ping -c 3 10.1.1.2
+
+Verification - Why Isolation Works:
+Check VPC1 routing table (no route to VPC2)
+sudo ip netns exec ns-vpc1-web ip route
+
+
+Task 5: VPC Peering (Cross-VPC After Peering)
+Create Peering:
+Establish peering connection
+sudo python3 vpcctl.py peer --vpc1 vpc1 --vpc2 vpc2
+
+
+
+Test Peering Works:
+bash# Test 1: VPC1 → VPC2
+sudo ip netns exec ns-vpc1-web ping -c 3 10.1.1.2
+
+
+# Test 2: VPC2 → VPC1
+sudo ip netns exec ns-vpc2-app ping -c 3 10.0.1.2
+
+
+# Test 3: VPC1 private subnet → VPC2
+sudo ip netns exec ns-vpc1-db ping -c 3 10.1.1.2
+
+
+Task 6: NAT Gateway (Public Internet Access)
+Test Commands:
+bash# Test 1: Public subnet can reach internet
+sudo ip netns exec ns-vpc1-web ping -c 3 8.8.8.8
+
+# Test 2: DNS resolution works
+sudo ip netns exec ns-vpc1-web ping -c 3 google.com
+
+# Test 3: HTTP request works
+sudo ip netns exec ns-vpc1-web curl -I https://google.com
+
+Task 7: Private Subnet Isolation from Internet
+Test Commands:
+Test: Private subnet CANNOT reach internet
+sudo ip netns exec ns-vpc1-db ping -c 3 8.8.8.8
+
+
+# Check private subnet can still reach public subnet
+sudo ip netns exec ns-vpc1-db ping -c 2 10.0.1.2
+
+
+
+Task 8: Workload Deployment
+Deploy Web Server:
+bash# Deploy nginx-like server in public subnet
+sudo python3 vpcctl.py deploy --vpc vpc1 --subnet web --type nginx --port 80
+
+Verification Commands:
+bash# 1. Check if HTML file was created
+ls -lh /etc/vpcctl/vpc1-web.html
+
+Test Web Server Access:
+Test 1: Access from host
+curl http://10.0.1.2:80/vpc1-web.html
+
+
+# Test 2: Access from another subnet (same VPC)
+sudo ip netns exec ns-vpc1-db curl http://10.0.1.2:80/vpc1-web.html
+
+
+# Test 3: Access from peered VPC
+sudo ip netns exec ns-vpc2-app curl http://10.0.1.2:80/vpc1-web.html
+
+Task 9: Firewall Policy Application
+create Firewall:
+cat > /tmp/web_firewall_policy.json << 'EOF'
+{
+  "subnet": "10.0.1.0/24",
+  "ingress": [
+    {"port": 8080, "protocol": "tcp", "action": "allow"},
+    {"port": 22, "protocol": "tcp", "action": "deny"}
+  ]
+}
+EOF
+
+Apply firewall rules
+sudo python3 vpcctl.py apply-firewall --vpc vpc1 --subnet web --policy /tmp/web_firewall_policy.json
+
+Verification Commands:
+1. Check iptables rules in namespace
+sudo ip netns exec ns-vpc1-web iptables -L INPUT -n -v
+
+ Test 1: Public subnet can not reach internet after the firewall
+sudo ip netns exec ns-vpc1-web ping -c 3 8.8.8.8
+
+
+Task 10: List All VPCs and Logs
+Command:
+List all VPCs with details
+sudo python3 vpcctl.py list
+
+# 1. Check VPC metadata
+sudo nano /etc/vpcctl/vpc1.json
+
+
+# 2. Check VPC Logs
+sudo nano /etc/vpcctl/vpcctl.log
+
+Task 11: Complete Cleanup
+Delete Subnet:
+bash# Delete a specific subnet
+sudo python3 vpcctl.py delete-subnet --vpc vpc1 --name db
+
+Delete VPCs:
+Delete VPC1
+sudo python3 vpcctl.py delete-vpc --name vpc1
+
+# Delete VPC2
+sudo python3 vpcctl.py delete-vpc --name vpc2
+
+Complete Cleanup Verification:
+bash# 1. No bridges remain
+ip link show type bridge | grep br-vpc
+
+# 4. No metadata files
+ls /etc/vpcctl/*.json
+
+
+# 5. Check logs still exist
+ls -lh /etc/vpcctl/vpcctl.log
+
+
+# 6. View last few log entries
+sudo tail -20 /etc/vpcctl/vpcctl.log
