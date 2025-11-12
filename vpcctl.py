@@ -77,6 +77,40 @@ class VPCManager:
             json.dump(vpc_data, f, indent=2)
         self.log(f"Saved VPC metadata: {vpc_file}")
     
+    def setup_vpc_isolation(self, vpc_data):
+        """Setup iptables rules for VPC isolation"""
+        bridge = vpc_data["bridge"]
+        cidr = vpc_data["cidr"]
+        
+        self.log(f"Setting up VPC isolation for {vpc_data['vpc_name']}")
+        
+        # Allow traffic within the same VPC (intra-VPC communication)
+        # Traffic entering and leaving the same bridge
+        self.run_command(
+            f"iptables -A FORWARD -i {bridge} -o {bridge} -s {cidr} -d {cidr} -j ACCEPT",
+            check=False
+        )
+        
+        # Get list of all existing VPC CIDRs to block traffic to them
+        vpc_files = list(VPCCTL_DIR.glob("*.json"))
+        for vpc_file in vpc_files:
+            try:
+                other_vpc_data = json.load(open(vpc_file))
+                other_cidr = other_vpc_data["cidr"]
+                other_bridge = other_vpc_data["bridge"]
+                
+                # Don't block traffic to itself
+                if other_cidr != cidr:
+                    # Block traffic from this VPC to other specific VPCs
+                    self.run_command(
+                        f"iptables -A FORWARD -i {bridge} -o {other_bridge} -s {cidr} -d {other_cidr} -j DROP",
+                        check=False
+                    )
+            except Exception as e:
+                self.log(f"Warning: Could not process VPC file {vpc_file}: {e}", "WARN")
+        
+        self.log(f"VPC isolation configured for {vpc_data['vpc_name']}")
+    
     def create_vpc(self, vpc_name, cidr):
         """Create a new VPC with specified CIDR"""
         # Validate inputs
@@ -102,8 +136,8 @@ class VPCManager:
         self.run_command(f"ip addr add {gateway_ip}/{network.prefixlen} dev {bridge_name}")
         self.run_command(f"ip link set {bridge_name} up")
         
-        # Enable IP forwarding on bridge
-        self.run_command(f"sysctl -w net.ipv4.ip_forward=1")
+        # Enable IP forwarding globally (required for routing)
+        self.run_command("sysctl -w net.ipv4.ip_forward=1")
         
         # Create VPC metadata
         vpc_data = {
@@ -115,6 +149,9 @@ class VPCManager:
             "peerings": [],
             "created_at": datetime.now().isoformat()
         }
+        
+        # Setup VPC isolation rules
+        self.setup_vpc_isolation(vpc_data)
         
         self.save_vpc(vpc_data)
         self.log(f"VPC '{vpc_name}' created successfully")
@@ -158,6 +195,8 @@ class VPCManager:
         # Create veth pair
         self.log(f"Creating veth pair: {veth_host} <-> {veth_ns}")
         self.run_command(f"ip link add {veth_host} type veth peer name {veth_ns}")
+        subnet_gateway = str(list(subnet_network.hosts())[0])
+        self.run_command(f"ip addr add {subnet_gateway}/{subnet_network.prefixlen} dev {vpc_data['bridge']}", check=False)
         
         # Move one end into namespace
         self.run_command(f"ip link set {veth_ns} netns {ns_name}")
@@ -171,13 +210,9 @@ class VPCManager:
         self.run_command(f"ip netns exec {ns_name} ip link set lo up")
         self.run_command(f"ip netns exec {ns_name} ip addr add {subnet_ip}/{subnet_network.prefixlen} dev {veth_ns}")
         self.run_command(f"ip netns exec {ns_name} ip link set {veth_ns} up")
-        self.run_command(f"ip netns exec {ns_name} ip route add default via {vpc_data['gateway_ip']}")
+        self.run_command(f"ip netns exec {ns_name} ip route add default via {subnet_gateway}")
         
-        # If public subnet, configure NAT
-        if subnet_type == "public":
-            self.configure_nat(vpc_name, subnet_cidr)
-        
-        # Save subnet metadata
+        # Save subnet metadata first
         vpc_data["subnets"][subnet_name] = {
             "cidr": subnet_cidr,
             "namespace": ns_name,
@@ -190,16 +225,22 @@ class VPCManager:
         }
         
         self.save_vpc(vpc_data)
+        
+        # If public subnet, configure NAT (do this AFTER saving metadata)
+        if subnet_type == "public":
+            self.configure_nat(vpc_name, subnet_cidr)
+        
         self.log(f"Subnet '{subnet_name}' created successfully in VPC '{vpc_name}'")
         return vpc_data
     
     def configure_nat(self, vpc_name, subnet_cidr):
-        """Configure NAT for a public subnet"""
+        """Configure NAT for a public subnet while maintaining VPC isolation"""
         self.log(f"Configuring NAT for subnet {subnet_cidr}")
         
         # Get default outbound interface
-        result = self.run_command("ip route | grep default | awk '{print $5}' | head -n1")
-        default_iface = result.stdout.strip()
+       # result = self.run_command("ip route | grep default | awk '{print $5}' | head -n1")
+        #default_iface = result.stdout.strip()
+        default_iface = 'ens33'
         
         if not default_iface:
             self.log("Warning: Could not determine default network interface", "WARN")
@@ -208,25 +249,27 @@ class VPCManager:
         vpc_data = self.load_vpc(vpc_name)
         bridge = vpc_data["bridge"]
         
-        # Enable masquerading for outbound traffic
+        # CRITICAL: Insert ACCEPT rules at the VERY TOP (position 1) of FORWARD chain
+        # Rule 1: Allow outbound traffic from public subnet to internet (but NOT to other VPC bridges)
+        self.run_command(
+            f"iptables -I FORWARD 1 -i {bridge} -o {default_iface} -s {subnet_cidr} -j ACCEPT",
+            check=False
+        )
+        
+        # Rule 2: Allow established/related connections back from internet
+        self.run_command(
+            f"iptables -I FORWARD 1 -i {default_iface} -o {bridge} -d {subnet_cidr} -m state --state RELATED,ESTABLISHED -j ACCEPT",
+            check=False
+        )
+        
+        # Enable masquerading for outbound traffic (NAT)
         self.run_command(
             f"iptables -t nat -A POSTROUTING -s {subnet_cidr} -o {default_iface} -j MASQUERADE",
             check=False
         )
         
-        # Allow forwarding from bridge to default interface
-        self.run_command(
-            f"iptables -A FORWARD -i {bridge} -o {default_iface} -j ACCEPT",
-            check=False
-        )
-        
-        # Allow established connections back
-        self.run_command(
-            f"iptables -A FORWARD -i {default_iface} -o {bridge} -m state --state RELATED,ESTABLISHED -j ACCEPT",
-            check=False
-        )
-        
         self.log(f"NAT configured for {subnet_cidr} via {default_iface}")
+        self.log(f"VPC isolation maintained - traffic only allowed to {default_iface}, not other VPCs")
     
     def deploy_workload(self, vpc_name, subnet_name, workload_type="nginx", port=80):
         """Deploy a test workload in a subnet"""
@@ -243,18 +286,42 @@ class VPCManager:
         
         if workload_type == "nginx":
             # Create a simple HTML file
-            html_content = f"""
-<!DOCTYPE html>
-<html>
-<head><title>VPC Test - {vpc_name}/{subnet_name}</title></head>
+            html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VPC Test - {vpc_name}/{subnet_name}</title>
+<style>
+body {{
+    font-family: Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    margin: 0;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+}}
+.container {{
+    text-align: center;
+    padding: 2rem;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    backdrop-filter: blur(10px);
+}}
+h2 {{ margin-bottom: 1rem; }}
+</style>
+</head>
 <body>
-    <h1>Hello from {vpc_name}/{subnet_name}</h1>
-    <p>IP: {subnet_ip}</p>
-    <p>Subnet: {subnet['cidr']}</p>
-    <p>Type: {subnet['type']}</p>
+<div class="container">
+<h2>Hello from {vpc_name}/{subnet_name}</h2>
+<p>IP: {subnet_ip}</p>
+<p>Subnet: {subnet['cidr']}</p>
+<p>Type: {subnet['type']}</p>
+</div>
 </body>
-</html>
-"""
+</html>"""
             html_file = VPCCTL_DIR / f"{vpc_name}-{subnet_name}.html"
             with open(html_file, "w") as f:
                 f.write(html_content)
@@ -378,13 +445,15 @@ class VPCManager:
                 check=False
             )
         
-        # Allow forwarding between bridges
+        # CRITICAL: Remove the DROP rules between these two specific VPCs
+        # and add ACCEPT rules for bidirectional traffic
+        # Insert at position 1 to ensure they're evaluated before DROP rules
         self.run_command(
-            f"iptables -A FORWARD -i {vpc1_data['bridge']} -o {vpc2_data['bridge']} -j ACCEPT",
+            f"iptables -I FORWARD 1 -i {vpc1_data['bridge']} -o {vpc2_data['bridge']} -s {vpc1_data['cidr']} -d {vpc2_data['cidr']} -j ACCEPT",
             check=False
         )
         self.run_command(
-            f"iptables -A FORWARD -i {vpc2_data['bridge']} -o {vpc1_data['bridge']} -j ACCEPT",
+            f"iptables -I FORWARD 1 -i {vpc2_data['bridge']} -o {vpc1_data['bridge']} -s {vpc2_data['cidr']} -d {vpc1_data['cidr']} -j ACCEPT",
             check=False
         )
         
@@ -582,35 +651,35 @@ def main():
         sys.exit(1)
     
     # Initialize VPC Manager
-    manager = VPCManager()
+    vpcctl = VPCManager()
     
     try:
         if args.command == "create-vpc":
-            manager.create_vpc(args.name, args.cidr)
+            vpcctl.create_vpc(args.name, args.cidr)
         
         elif args.command == "create-subnet":
-            manager.create_subnet(args.vpc, args.name, args.cidr, args.type)
+            vpcctl.create_subnet(args.vpc, args.name, args.cidr, args.type)
         
         elif args.command == "deploy":
-            manager.deploy_workload(args.vpc, args.subnet, args.type, args.port)
+            vpcctl.deploy_workload(args.vpc, args.subnet, args.type, args.port)
         
         elif args.command == "apply-firewall":
-            manager.apply_firewall(args.vpc, args.subnet, args.policy)
+            vpcctl.apply_firewall(args.vpc, args.subnet, args.policy)
         
         elif args.command == "peer":
-            manager.peer_vpcs(args.vpc1, args.vpc2)
+            vpcctl.peer_vpcs(args.vpc1, args.vpc2)
         
         elif args.command == "list":
-            manager.list_vpcs()
+            vpcctl.list_vpcs()
         
         elif args.command == "delete-subnet":
-            manager.delete_subnet(args.vpc, args.name)
+            vpcctl.delete_subnet(args.vpc, args.name)
         
         elif args.command == "delete-vpc":
-            manager.delete_vpc(args.name)
+            vpcctl.delete_vpc(args.name)
     
     except Exception as e:
-        manager.log(f"Error: {e}", "ERROR")
+        vpcctl.log(f"Error: {e}", "ERROR")
         sys.exit(1)
 
 
